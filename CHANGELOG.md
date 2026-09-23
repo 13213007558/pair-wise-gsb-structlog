@@ -15,6 +15,12 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.fanout`: a new `FanOut` terminal processor that dispatches one event to multiple `Branch`es, each with its own processor chain and sink.
+  Shared pre-processing runs once; every branch receives an independent snapshot of the event dict's built-in containers (nested `dict`s / `list`s are copied, user objects are shared by reference without calling their `__deepcopy__` hooks, customizable via a snapshot adapter).
+  `structlog.DropEvent` drops only the current branch, other exceptions are handled with a fail-fast or collect strategy (the latter raises `structlog.fanout.FanOutError` with per-branch results after all branches ran), and re-entrant use of the same fan-out logger from a sink is detected and raises `structlog.fanout.FanOutReentrancyError`.
+
 
 ## [26.1.0](https://github.com/hynek/structlog/compare/25.5.0...26.1.0) - 2026-06-06
 

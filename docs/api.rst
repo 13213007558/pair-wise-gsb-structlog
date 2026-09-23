@@ -291,6 +291,22 @@ API Reference
 .. autoclass:: CallsiteParameterAdder
 
 
+`structlog.fanout` Module
+--------------------------
+
+.. automodule:: structlog.fanout
+
+.. autoclass:: FanOut
+
+.. autoclass:: Branch
+
+.. autoclass:: BranchResult
+
+.. autoexception:: FanOutError
+
+.. autoexception:: FanOutReentrancyError
+
+
 `structlog.stdlib` Module
 -------------------------
 
