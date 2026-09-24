@@ -272,7 +272,7 @@ class TestLogfmtRenderer:
 
         rv = LogfmtRenderer()(None, None, event_dict)
 
-        assert r"with_newline=some\nvalue" == rv
+        assert r'with_newline="some\nvalue"' == rv
 
     @pytest.mark.parametrize(
         ("raw", "escaped"),
