@@ -9,6 +9,7 @@ from __future__ import annotations
 from structlog import (
     contextvars,
     dev,
+    logfmt,
     processors,
     stdlib,
     testing,
@@ -77,6 +78,7 @@ __all__ = [
     "get_context",
     "get_logger",
     "is_configured",
+    "logfmt",
     "make_filtering_bound_logger",
     "processors",
     "reset_defaults",

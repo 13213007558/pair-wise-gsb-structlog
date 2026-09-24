@@ -301,6 +301,24 @@ class TestLogfmtRenderer:
 
         assert f"key={escaped}" == rv
 
+    @pytest.mark.parametrize(
+        ("raw", "escaped"),
+        [
+            # A literal backslash-n would be parsed back as a newline.
+            (r"literal\nnewline", r'"literal\\nnewline"'),
+            # Double backslashes would collapse into one.
+            (r"double\\backslash", r'"double\\\\backslash"'),
+        ],
+    )
+    def test_escape_like_sequences_force_quoting(self, raw, escaped):
+        """
+        Values containing backslash sequences that a parser would read as
+        escapes are quoted, so the output round-trips.
+        """
+        rv = LogfmtRenderer()(None, None, {"key": raw})
+
+        assert f"key={escaped}" == rv
+
 
 class TestJSONRenderer:
     def test_renders_json(self, event_dict):

@@ -16,6 +16,17 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
 
+### Added
+
+- `structlog.logfmt.LogfmtParser`: an incremental parser for logfmt records as emitted by `structlog.processors.LogfmtRenderer`.
+  It accepts text or UTF-8 bytes in arbitrary chunks (records may span chunks, byte chunks may split multi-byte characters), returns one list of ordered `(key, value)` fields per record -- preserving duplicate keys -- and offers a strict mode that raises `structlog.logfmt.LogfmtParseError` (carrying the stream offset) as well as a skip-bad-records mode.
+  Overlong unterminated records are bounded by an explicit `max_record_size`.
+
+### Changed
+
+- `structlog.processors.LogfmtRenderer` now also quotes values containing backslash sequences that a parser would read as escapes (e.g. a literal `\n`), so its output always round-trips through `structlog.logfmt.LogfmtParser`.
+
+
 ## [26.1.0](https://github.com/hynek/structlog/compare/25.5.0...26.1.0) - 2026-06-06
 
 ### Removed

@@ -291,6 +291,24 @@ API Reference
 .. autoclass:: CallsiteParameterAdder
 
 
+`structlog.logfmt` Module
+--------------------------
+
+.. autoclass:: structlog.logfmt.LogfmtParser
+   :members: feed, flush
+
+   .. doctest::
+
+      >>> from structlog.logfmt import LogfmtParser
+      >>> parser = LogfmtParser()
+      >>> parser.feed('a=1 b="two')
+      []
+      >>> parser.feed(' words" flag\n')
+      [[('a', '1'), ('b', 'two words'), ('flag', None)]]
+
+.. autoclass:: structlog.logfmt.LogfmtParseError
+
+
 `structlog.stdlib` Module
 -------------------------
 

@@ -125,6 +125,9 @@ class LogfmtRenderer:
 
     .. _logfmt: https://brandur.org/logfmt
 
+    The output can be parsed back using
+    :class:`structlog.logfmt.LogfmtParser`.
+
     Args:
         sort_keys: Whether to sort keys when formatting.
 
@@ -146,6 +149,10 @@ class LogfmtRenderer:
         ValueError: If a key contains non-printable or whitespace characters.
 
     .. versionadded:: 21.5.0
+    .. versionchanged:: 26.2.0
+        Values containing backslash sequences that a parser would read as
+        escapes (e.g. a literal ``\n``) are now quoted, so rendered output
+        always round-trips through :class:`structlog.logfmt.LogfmtParser`.
     """
 
     bool_as_flag: bool
@@ -183,6 +190,12 @@ class LogfmtRenderer:
             backslashes_need_escaping = (
                 " " in value or "=" in value or '"' in value
             )
+            if not backslashes_need_escaping and "\\" in value:
+                # A backslash that a parser would read as an escape sequence
+                # (e.g. a literal \n or \\) must force quoting, otherwise the
+                # output would not round-trip through logfmt.LogfmtParser.
+                backslashes_need_escaping = "\\\\" in value or "\\n" in value
+
             if backslashes_need_escaping and "\\" in value:
                 value = value.replace("\\", "\\\\")
 
