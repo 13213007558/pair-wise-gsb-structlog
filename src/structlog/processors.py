@@ -9,6 +9,7 @@ Processors useful regardless of the logging framework.
 
 from __future__ import annotations
 
+import copy
 import datetime
 import enum
 import json
@@ -19,13 +20,14 @@ import sys
 import threading
 import time
 
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from types import FrameType, TracebackType
 from typing import (
     Any,
     ClassVar,
     Final,
     NamedTuple,
+    NoReturn,
     TextIO,
     cast,
 )
@@ -38,6 +40,7 @@ from ._frames import (
 from ._log_levels import NAME_TO_LEVEL, add_log_level
 from ._utils import get_processname
 from .contextvars import _ASYNC_CALLING_THREAD
+from .exceptions import DropEvent
 from .tracebacks import ExceptionDictTransformer
 from .typing import (
     EventDict,
@@ -48,6 +51,9 @@ from .typing import (
 
 
 __all__ = [
+    "Branch",
+    "BranchProcessingError",
+    "BranchingProcessor",
     "NAME_TO_LEVEL",  # some people rely on it being here
     "CallsiteParameter",
     "CallsiteParameterAdder",
@@ -61,9 +67,225 @@ __all__ = [
     "UnicodeDecoder",
     "UnicodeEncoder",
     "add_log_level",
+    "copy_event_dict",
+    "deepcopy_event_dict",
     "dict_tracebacks",
     "format_exc_info",
 ]
+
+
+class Branch(NamedTuple):
+    """
+    A processor chain and output logger used by `BranchingProcessor`.
+
+    Args:
+        logger: Logger that receives the branch's rendered event.
+        processors: Processors that only run for this branch.
+    """
+
+    logger: WrappedLogger
+    processors: Sequence[Processor] = ()
+
+
+class BranchProcessingError(Exception):
+    """
+    Errors raised by one or more branches.
+
+    Set ``raise_early=False`` on `BranchingProcessor` to run every branch and
+    collect their errors in this exception.
+    """
+
+    exceptions: tuple[BaseException, ...]
+
+    def __init__(self, exceptions: Collection[BaseException]) -> None:
+        self.exceptions = tuple(exceptions)
+        super().__init__(
+            f"{len(self.exceptions)} log branch(es) failed",
+            self.exceptions,
+        )
+
+
+def deepcopy_event_dict(event_dict: EventDict) -> EventDict:
+    """
+    Deep-copy *event_dict* using Python's standard `copy.deepcopy`.
+
+    This provides complete isolation for values that support deep copying.
+    Values such as tracebacks, open files, sockets, and some extension objects
+    may raise an error or be unsuitable for deep copying.
+    """
+    return copy.deepcopy(event_dict)
+
+
+def copy_event_dict(event_dict: EventDict) -> EventDict:
+    """
+    Return an isolated copy for one log branch.
+
+    Dictionaries, lists, tuples, and sets are copied recursively. Other
+    values--including exception instances, tracebacks, stack frames, log
+    records, files, and sockets--are shared.
+
+    This allows events containing values that cannot safely be deep-copied to
+    be fanned out, while still isolating nested event data. Branches that
+    mutate shared opaque values can still make those changes visible to other
+    branches; pass `deepcopy_event_dict`, or a custom callable, to
+    `BranchingProcessor` when those values support a domain-specific copy.
+    """
+    return _copy_event_dict_value(event_dict, {})
+
+
+def _copy_event_dict_value(value: Any, memo: dict[int, Any]) -> Any:
+    immutable_types = (
+        str,
+        bytes,
+        bytearray,
+        int,
+        float,
+        complex,
+        bool,
+        type(None),
+        enum.Enum,
+    )
+    if isinstance(value, immutable_types):
+        return value
+
+    value_id = id(value)
+    if value_id in memo:
+        return memo[value_id]
+
+    if isinstance(value, BaseException) or isinstance(
+        value, (TracebackType, FrameType)
+    ):
+        return value
+
+    if isinstance(value, logging.LogRecord):
+        return _copy_log_record(value, memo)
+
+    if isinstance(value, dict):
+        copied = value.copy()
+        copied.clear()
+        memo[value_id] = copied
+        for key, item in value.items():
+            copied[_copy_event_dict_value(key, memo)] = (
+                _copy_event_dict_value(item, memo)
+            )
+        return copied
+
+    if isinstance(value, list):
+        copied = value.copy()
+        memo[value_id] = copied
+        for index, item in enumerate(copied):
+            copied[index] = _copy_event_dict_value(item, memo)
+        return copied
+
+    if isinstance(value, tuple):
+        return tuple(
+            _copy_event_dict_value(item, memo) for item in value
+        )
+
+    if isinstance(value, set):
+        copied = value.copy()
+        copied.clear()
+        memo[value_id] = copied
+        for item in value:
+            copied.add(_copy_event_dict_value(item, memo))
+        return copied
+
+    return value
+
+
+def _copy_log_record(
+    record: logging.LogRecord, memo: dict[int, Any]
+) -> logging.LogRecord:
+    copied = logging.makeLogRecord({})
+    memo[id(record)] = copied
+    for key, value in record.__dict__.items():
+        setattr(copied, key, _copy_event_dict_value(value, memo))
+    return copied
+
+
+class BranchingProcessor:
+    """
+    Fan an event out to independent processor chains and output loggers.
+
+    Processors before this one form the common chain and run exactly once.
+    Each branch receives its own copy of the event dictionary. A branch that
+    raises `structlog.DropEvent` is skipped without affecting the other
+    branches or the common chain.
+
+    After processing its chain, the branch output logger is called with the
+    final processor's return value using the same rules as a regular structlog
+    chain. This processor then raises `DropEvent` so the original wrapped
+    logger is not called; place it at the end of the common chain.
+
+    Args:
+        branches: Branch definitions to process in order.
+        copy_event_dict: Public policy used to copy each branch event dict.
+        raise_early: If True, raise the first branch exception immediately.
+            If False, run the remaining branches and raise
+            `BranchProcessingError` containing all exceptions.
+
+    .. versionadded:: 26.2.0
+    """
+
+    def __init__(
+        self,
+        branches: Collection[Branch],
+        *,
+        copier: Callable[[EventDict], EventDict] = copy_event_dict,
+        raise_early: bool = True,
+    ) -> None:
+        self.branches = tuple(branches)
+        self.copier = copier
+        self.raise_early = raise_early
+
+    def __call__(
+        self, logger: WrappedLogger, method_name: str, event_dict: EventDict
+    ) -> NoReturn:
+        errors: list[BaseException] = []
+
+        for branch in self.branches:
+            try:
+                branch_event_dict = self.copier(event_dict)
+                result: Any = branch_event_dict
+                for processor in branch.processors:
+                    result = processor(
+                        branch.logger, method_name, result
+                    )
+                self._emit(branch.logger, method_name, result)
+            except DropEvent:
+                continue
+            except Exception as error:
+                if self.raise_early:
+                    raise
+                errors.append(error)
+
+        if errors:
+            raise BranchProcessingError(errors)
+
+        raise DropEvent
+
+    @staticmethod
+    def _emit(
+        logger: WrappedLogger, method_name: str, result: Any
+    ) -> None:
+        if isinstance(result, (str, bytes, bytearray)):
+            args: tuple[Any, ...] = (result,)
+            kwargs: dict[str, Any] = {}
+        elif isinstance(result, tuple):
+            if len(result) != 2:
+                msg = "A tuple return value must be (args, kwargs)."
+                raise ValueError(msg)
+            args, kwargs = result
+        elif isinstance(result, Mapping):
+            args, kwargs = (), dict(result)
+        else:
+            msg = (
+                "The last processor in a branch must return a dict, a "
+                "tuple of (args, kwargs), bytes, bytearray, or a str."
+            )
+            raise ValueError(msg)
+
+        getattr(logger, method_name)(*args, **kwargs)
 
 
 class KeyValueRenderer:
