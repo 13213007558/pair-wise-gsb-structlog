@@ -166,6 +166,33 @@ Advanced log aggregation and analysis tools like [Logstash](https://www.elastic.
 For a list of shipped processors, check out the {ref}`API documentation <procs>`.
 
 
+## Fanning out to multiple outputs
+
+Sometimes the same event should go to more than one destination -- for example as JSON to a log collector and as plain text to a terminal.
+{class}`structlog.processors.FanOut` is a terminal processor that dispatches the event to multiple {class}`~structlog.processors.Branch`es, each with its own processor chain and output logger:
+
+```python
+structlog.configure(
+    processors=[
+        # Common processors run exactly once per log call.
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.FanOut(
+            (json_logger, [structlog.processors.JSONRenderer()]),
+            (console_logger, [structlog.dev.ConsoleRenderer()]),
+        ),
+    ],
+    ...
+)
+```
+
+Each branch receives an isolated deep copy of the event dictionary (see {func}`structlog.processors.safe_deepcopy` for the default copy strategy and its limitations), so branches can't affect each other or the bound logger's context.
+A {class}`structlog.DropEvent` raised within a branch only drops that branch.
+Other exceptions either propagate immediately (the default, ``on_error="raise"``) or are collected and raised as a {class}`structlog.exceptions.FanOutError` after all branches ran (``on_error="collect"``).
+
+Branches can also end in {func}`structlog.stdlib.ProcessorFormatter.wrap_for_formatter` and dispatch to standard library loggers.
+
+
 ## Third-Party packages
 
 *structlog* was specifically designed to be as composable and reusable as possible, so whatever you're missing:

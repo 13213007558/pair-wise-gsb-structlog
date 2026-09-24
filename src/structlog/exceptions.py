@@ -18,6 +18,24 @@ class DropEvent(BaseException):
     """
 
 
+class FanOutError(Exception):
+    """
+    One or more branches of `structlog.processors.FanOut` raised an
+    exception while it was configured with ``on_error="collect"``.
+
+    The original exceptions are available in the `errors` attribute.
+
+    .. versionadded:: 26.2.0
+    """
+
+    def __init__(self, errors: list[Exception]):
+        self.errors = tuple(errors)
+        super().__init__(
+            f"{len(self.errors)} fan-out branch(es) failed: "
+            + ", ".join(repr(e) for e in self.errors)
+        )
+
+
 class NoConsoleRendererConfiguredError(Exception):
     """
     A user asked for the current `structlog.dev.ConsoleRenderer` but none is

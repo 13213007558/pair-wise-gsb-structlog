@@ -66,6 +66,8 @@ API Reference
 
 .. autoexception:: DropEvent
 
+.. autoexception:: FanOutError
+
 .. autoclass:: BoundLoggerBase
    :members: new, bind, unbind, try_unbind, _logger, _process_event, _proxy_to_logger
 
@@ -289,6 +291,12 @@ API Reference
    :members:
 
 .. autoclass:: CallsiteParameterAdder
+
+.. autoclass:: FanOut
+
+.. autoclass:: Branch
+
+.. autofunction:: safe_deepcopy
 
 
 `structlog.stdlib` Module

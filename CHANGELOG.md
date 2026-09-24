@@ -15,6 +15,11 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.processors.FanOut` fans a log entry out to multiple `structlog.processors.Branch`es, each with its own processor chain and output logger.
+  Common processors before it run only once per log call; each branch gets an isolated copy of the event dictionary (using the public `structlog.processors.safe_deepcopy` copy strategy by default), `structlog.DropEvent` only terminates the current branch, and other exceptions either propagate immediately or are collected into a `structlog.exceptions.FanOutError`, depending on the new *on_error* option.
+
 
 ## [26.1.0](https://github.com/hynek/structlog/compare/25.5.0...26.1.0) - 2026-06-06
 

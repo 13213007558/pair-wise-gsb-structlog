@@ -9,6 +9,7 @@ Processors useful regardless of the logging framework.
 
 from __future__ import annotations
 
+import copy
 import datetime
 import enum
 import json
@@ -38,21 +39,25 @@ from ._frames import (
 from ._log_levels import NAME_TO_LEVEL, add_log_level
 from ._utils import get_processname
 from .contextvars import _ASYNC_CALLING_THREAD
+from .exceptions import DropEvent, FanOutError
 from .tracebacks import ExceptionDictTransformer
 from .typing import (
     EventDict,
     ExceptionTransformer,
     ExcInfo,
+    Processor,
     WrappedLogger,
 )
 
 
 __all__ = [
     "NAME_TO_LEVEL",  # some people rely on it being here
+    "Branch",
     "CallsiteParameter",
     "CallsiteParameterAdder",
     "EventRenamer",
     "ExceptionPrettyPrinter",
+    "FanOut",
     "JSONRenderer",
     "KeyValueRenderer",
     "LogfmtRenderer",
@@ -63,6 +68,7 @@ __all__ = [
     "add_log_level",
     "dict_tracebacks",
     "format_exc_info",
+    "safe_deepcopy",
 ]
 
 
@@ -1003,3 +1009,182 @@ class EventRenamer:
                 event_dict["event"] = replace_by
 
         return event_dict
+
+
+def safe_deepcopy(event_dict: EventDict) -> EventDict:
+    """
+    Deep-copy *event_dict* so that branches of `FanOut` are isolated from
+    each other and from the bound logger's context.
+
+    First tries to deep-copy the whole dictionary at once. If that fails --
+    for example because a value like a traceback or a lock can't be copied
+    -- falls back to copying key by key, sharing values that can't be
+    deep-copied by reference.
+
+    .. note::
+
+       Values that can't be deep-copied (e.g. exception objects carrying a
+       traceback, open files, locks) are shared by reference between all
+       branches. Branches must not mutate such values in place. Even when
+       deep-copying an exception object succeeds, its ``__traceback__`` is
+       not preserved by `copy.deepcopy`.
+
+    This is the default *copier* of `FanOut`.
+
+    .. versionadded:: 26.2.0
+    """
+    try:
+        return cast(EventDict, copy.deepcopy(event_dict))
+    except Exception:  # noqa: BLE001
+        # Fall back to key-by-key copying so that one uncopyable value
+        # doesn't break the isolation of the rest.
+        copied = {}
+        for key, value in event_dict.items():
+            try:
+                copied[key] = copy.deepcopy(value)
+            except Exception:  # noqa: BLE001
+                copied[key] = value
+
+        return copied
+
+
+class Branch(NamedTuple):
+    """
+    A single output branch of `FanOut`.
+
+    Attributes:
+        logger:
+            The wrapped logger the rendered event is dispatched to. It is
+            also passed as the first argument to the branch's processors.
+
+        processors:
+            The processor chain that is run only for this branch. The last
+            processor must return a value that the logger's methods accept:
+            a `str`, `bytes`, `bytearray`, a ``(args, kwargs)`` tuple, or a
+            `dict` of keyword arguments.
+
+    .. versionadded:: 26.2.0
+    """
+
+    logger: WrappedLogger
+    processors: Sequence[Processor]
+
+
+class FanOut:
+    """
+    Fan a log entry out to multiple branches, each with its own processor
+    chain and output logger.
+
+    Must be the **last** processor in the chain. All processors before it
+    (the *common* part) run exactly once per log call. Afterwards, each
+    branch receives an isolated copy of the event dictionary, runs its own
+    processors, and dispatches the result to its own logger. This allows,
+    for example, rendering the same event as JSON for a log collector and
+    as plain text for a terminal, while sharing expensive common
+    pre-processing.
+
+    Args:
+        branches:
+            `Branch` objects (or ``(logger, processors)`` tuples) to
+            dispatch the event to.
+
+        copier:
+            A callable that copies the event dictionary for each branch.
+            The default is `safe_deepcopy`, which isolates branches from
+            each other and from the bound logger's context. Pass
+            `copy.copy` for a cheaper shallow copy if your branches don't
+            mutate nested values.
+
+        on_error:
+            What to do when a branch raises an exception (a
+            `structlog.DropEvent` always only drops its own branch):
+
+            - ``"raise"`` (default): re-raise immediately, skipping the
+              remaining branches.
+            - ``"collect"``: keep dispatching to the remaining branches and
+              raise a `structlog.exceptions.FanOutError` containing all
+              errors after the last branch.
+
+    After all branches have been dispatched, `structlog.DropEvent` is
+    raised so the outer logger's wrapped logger stays silent -- all output
+    happens in the branches.
+
+    .. versionadded:: 26.2.0
+    """
+
+    def __init__(
+        self,
+        *branches: Branch | tuple[WrappedLogger, Sequence[Processor]],
+        copier: Callable[[EventDict], EventDict] = safe_deepcopy,
+        on_error: str = "raise",
+    ) -> None:
+        if on_error not in ("raise", "collect"):
+            msg = f"on_error must be 'raise' or 'collect', not {on_error!r}."
+            raise ValueError(msg)
+
+        self._branches = [
+            b if isinstance(b, Branch) else Branch(*b) for b in branches
+        ]
+        self._copier = copier
+        self._on_error = on_error
+
+    def __call__(
+        self, logger: WrappedLogger, method_name: str, event_dict: EventDict
+    ) -> EventDict:
+        errors: list[Exception] = []
+
+        for branch in self._branches:
+            try:
+                ed = self._copier(event_dict)
+
+                for proc in branch.processors:
+                    ed = cast(EventDict, proc(branch.logger, method_name, ed))
+
+                self._dispatch(branch.logger, method_name, ed)
+            except DropEvent:
+                # Only terminates the current branch.
+                continue
+            except Exception as e:  # noqa: BLE001
+                if self._on_error == "raise":
+                    raise
+
+                errors.append(e)
+
+        if errors:
+            raise FanOutError(errors)
+
+        # All output happened in the branches; silence the outer logger.
+        raise DropEvent
+
+    @staticmethod
+    def _dispatch(
+        logger: WrappedLogger, method_name: str, result: Any
+    ) -> None:
+        """
+        Call *method_name* on *logger* with a final processor's *result*.
+
+        Mirrors the return-value handling of
+        `structlog.BoundLoggerBase._process_event`.
+        """
+        meth = getattr(logger, method_name)
+
+        if isinstance(result, (str, bytes, bytearray)):
+            meth(result)
+            return
+
+        if isinstance(result, tuple):
+            # Assume the last processor returned a tuple of (args, kwargs).
+            args, kwargs = result
+            meth(*args, **kwargs)
+            return
+
+        if isinstance(result, dict):
+            meth(**result)
+            return
+
+        msg = (
+            "Last processor of a fan-out branch didn't return an appropriate"
+            " value.  Valid return values are a dict, a tuple of"
+            " (args, kwargs), bytes, or a str."
+        )
+        raise ValueError(msg)
