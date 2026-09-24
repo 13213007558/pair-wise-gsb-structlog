@@ -339,6 +339,7 @@ API Reference
 .. autoclass:: Trace
 .. autoclass:: Stack
 .. autoclass:: Frame
+.. autoclass:: Truncated
 .. autoclass:: SyntaxError_
 
 

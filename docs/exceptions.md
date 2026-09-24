@@ -32,6 +32,20 @@ The most common use-cases are already covered by the following processors:
 {class}`structlog.tracebacks.ExceptionDictTransformer` can be customized with a number of parameters.
 If these prove insufficient, see {ref}`Custom Filtering of Dict Tracebacks <custom-dict-tracebacks>`.
 
+#### Budgeting the size of the whole exception tree
+
+*max_frames* applies to each stack separately, so with long *cause*/*context* chains or wide `ExceptionGroup`s, the resulting JSON can still grow large enough to be dropped by your log aggregator.
+To bound the *whole* exception tree, {class}`~structlog.tracebacks.ExceptionDictTransformer` offers three budgets that are off by default and can be enabled independently:
+
+- *max_total_frames* limits the total number of frames across all stacks.
+- *max_branches* limits the number of rendered exception branches (stacks).
+- *locals_max_total_bytes* limits the total number of bytes (UTF-8) spent on rendered local variables.
+
+Budgets are spent in a fixed order: a stack, then its exception group children in order, then its cause/context chain.
+Every rendered branch keeps its overview (exception type, value, notes, and position in the hierarchy), and within each stack the shallowest and innermost frames are kept while frames are removed from the middle out.
+Omitted parts leave structured counts behind: elided frames are reported in place, omitted locals in the frame's `locals_omitted` key, and omitted branches as a `{"truncated": {"stacks": N, "frames": M}}` placeholder.
+Since budgets are enforced during extraction, no `repr()` is computed for locals that are omitted.
+
 
 ## Console rendering
 

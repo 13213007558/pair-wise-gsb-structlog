@@ -15,6 +15,12 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.tracebacks.ExceptionDictTransformer` now supports optional whole-exception-tree budgets that bound the serialized size of long cause/context chains and wide exception groups: *max_total_frames* (total frames), *max_branches* (rendered exception branches), and *locals_max_total_bytes* (total bytes spent on rendered locals).
+  Budgets are spent in a fixed order, every rendered branch keeps its overview, and omitted parts leave structured counts behind (`locals_omitted` on frames and `{"truncated": {"stacks": N, "frames": M}}` placeholders for branches).
+  All budgets are off by default, so existing configurations are unaffected.
+
 
 ## [26.1.0](https://github.com/hynek/structlog/compare/25.5.0...26.1.0) - 2026-06-06
 

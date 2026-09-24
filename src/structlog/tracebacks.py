@@ -40,6 +40,7 @@ __all__ = [
     "Stack",
     "SyntaxError_",
     "Trace",
+    "Truncated",
     "extract",
     "safe_str",
     "to_repr",
@@ -58,12 +59,16 @@ OptExcInfo: TypeAlias = ExcInfo | tuple[None, None, None]
 class Frame:
     """
     Represents a single stack frame.
+
+    .. versionchanged:: 26.2.0
+       Added the *locals_omitted* field.
     """
 
     filename: str
     lineno: int
     name: str
     locals: dict[str, str] | None = None
+    locals_omitted: int | None = None
 
 
 @dataclass
@@ -102,12 +107,32 @@ class Stack:
 
 
 @dataclass
+class Truncated:
+    """
+    Placeholder for parts of an exception tree that were omitted because a
+    budget of :class:`ExceptionDictTransformer` was exhausted.
+
+    *stacks* is the number of omitted exception branches and *frames* is the
+    total number of frames they would have produced.
+
+    .. versionadded:: 26.2.0
+    """
+
+    stacks: int = 0
+    frames: int = 0
+
+
+@dataclass
 class Trace:
     """
     Container for a list of stack traces.
+
+    .. versionchanged:: 26.2.0
+       *stacks* may also contain :class:`Truncated` placeholders if
+       budgets are enabled on :class:`ExceptionDictTransformer`.
     """
 
-    stacks: list[Stack]
+    stacks: list[Stack | Truncated]
 
 
 def safe_str(_object: Any) -> str:
@@ -180,6 +205,60 @@ def to_repr(
     return obj_repr
 
 
+@dataclass
+class _Budget:
+    """
+    Remaining whole-tree budgets shared by one extract() call tree.
+
+    A field set to None means "unlimited".
+    """
+
+    frames: int | None = None
+    branches: int | None = None
+    locals_bytes: int | None = None
+    per_stack_frames: int = MAX_FRAMES
+
+
+def _count_omitted(
+    exc_value: BaseException, seen: set[int], truncated: Truncated
+) -> None:
+    """
+    Add the numbers of stacks and frames that extracting *exc_value* would
+    produce to *truncated*.
+
+    Nothing is rendered, so neither __str__() nor __repr__() are called.
+    """
+    while True:
+        exc_id = id(exc_value)
+        if exc_id in seen:
+            return
+        seen.add(exc_id)
+
+        truncated.stacks += 1
+        truncated.frames += sum(1 for _ in walk_tb(exc_value.__traceback__))
+
+        if sys.version_info >= (3, 11):
+            if isinstance(exc_value, (BaseExceptionGroup, ExceptionGroup)):  # noqa: F821
+                for exception in exc_value.exceptions:
+                    _count_omitted(exception, seen, truncated)
+
+        cause = getattr(exc_value, "__cause__", None)
+        if cause and cause.__traceback__:
+            exc_value = cause
+            continue
+
+        cause = exc_value.__context__
+        if (
+            cause
+            and cause.__traceback__
+            and not getattr(exc_value, "__suppress_context__", False)
+        ):
+            exc_value = cause
+            continue
+
+        return
+
+
 def extract(
     exc_type: type[BaseException],
     exc_value: BaseException,
@@ -192,6 +271,7 @@ def extract(
     locals_hide_sunder: bool = False,
     use_rich: bool = True,
     _seen: set[int] | None = None,
+    _budget: _Budget | None = None,
 ) -> Trace:
     """
     Extract traceback information.
@@ -242,7 +322,7 @@ def extract(
        Handle loops in exception cause chain.
     """
 
-    stacks: list[Stack] = []
+    stacks: list[Stack | Truncated] = []
     is_cause = False
 
     if _seen is None:
@@ -252,7 +332,20 @@ def extract(
         exc_id = id(exc_value)
         if exc_id in _seen:
             break
+
+        if (
+            _budget is not None
+            and _budget.branches is not None
+            and _budget.branches <= 0
+        ):
+            truncated = Truncated()
+            _count_omitted(exc_value, set(_seen), truncated)
+            stacks.append(truncated)
+            break
+
         _seen.add(exc_id)
+        if _budget is not None and _budget.branches is not None:
+            _budget.branches -= 1
 
         stack = Stack(
             exc_type=safe_str(exc_type.__name__),
@@ -266,7 +359,19 @@ def extract(
         if sys.version_info >= (3, 11):
             if isinstance(exc_value, (BaseExceptionGroup, ExceptionGroup)):  # noqa: F821
                 stack.is_group = True
-                for exception in exc_value.exceptions:
+                children = exc_value.exceptions
+                for index, exception in enumerate(children):
+                    if (
+                        _budget is not None
+                        and _budget.branches is not None
+                        and _budget.branches <= 0
+                    ):
+                        truncated = Truncated()
+                        count_seen = set(_seen)
+                        for remaining in children[index:]:
+                            _count_omitted(remaining, count_seen, truncated)
+                        stack.exceptions.append(Trace(stacks=[truncated]))
+                        break
                     stack.exceptions.append(
                         extract(
                             type(exception),
@@ -279,6 +384,7 @@ def extract(
                             locals_hide_sunder=locals_hide_sunder,
                             use_rich=use_rich,
                             _seen=_seen,
+                            _budget=_budget,
                         )
                     )
 
@@ -308,7 +414,62 @@ def extract(
                     continue
                 yield key, value
 
-        for frame_summary, line_no in walk_tb(traceback):
+        def render_locals(
+            frame_summary: Any,
+        ) -> tuple[dict[str, str], int | None]:
+            """
+            Render a frame's locals, honoring the locals byte budget.
+
+            Returns the rendered locals and the number of omitted ones (None
+            if none were omitted).
+            """
+            rendered_locals: dict[str, str] = {}
+            omitted = 0
+            for key, value in get_locals(frame_summary.f_locals.items()):
+                if (
+                    _budget is not None
+                    and _budget.locals_bytes is not None
+                    and _budget.locals_bytes <= 0
+                ):
+                    omitted += 1
+                    continue
+                rendered = to_repr(
+                    value,
+                    max_length=locals_max_length,
+                    max_string=locals_max_string,
+                    use_rich=use_rich,
+                )
+                if _budget is not None and _budget.locals_bytes is not None:
+                    _budget.locals_bytes -= len(rendered.encode("utf-8"))
+                rendered_locals[key] = rendered
+            return rendered_locals, (omitted or None)
+
+        all_frames = list(walk_tb(traceback))
+        n_frames = len(all_frames)
+        keep = n_frames
+        if _budget is not None:
+            keep = min(keep, _budget.per_stack_frames)
+            if _budget.frames is not None:
+                keep = min(keep, max(0, _budget.frames))
+                _budget.frames -= keep
+
+        # Frames are removed from the middle out, keeping the shallowest
+        # and the innermost ones.
+        head = keep // 2
+        tail = keep - head
+
+        for index, (frame_summary, line_no) in enumerate(all_frames):
+            if keep < n_frames and index == head:
+                append(
+                    Frame(
+                        filename="",
+                        lineno=-1,
+                        name=f"Skipped frames: {n_frames - keep}",
+                    )
+                )
+            if keep < n_frames and head <= index < n_frames - tail:
+                # This frame is part of the elided middle.
+                continue
             filename = frame_summary.f_code.co_filename
             if filename and not filename.startswith("<"):
                 filename = os.path.abspath(filename)
@@ -316,25 +477,17 @@ def extract(
             # if frame_summary.f_locals.get("_rich_traceback_omit", False):
             #     continue  # noqa: ERA001
 
+            if show_locals:
+                frame_locals, locals_omitted = render_locals(frame_summary)
+            else:
+                frame_locals, locals_omitted = {}, None
+
             frame = Frame(
                 filename=filename or "?",
                 lineno=line_no,
                 name=frame_summary.f_code.co_name,
-                locals=(
-                    {
-                        key: to_repr(
-                            value,
-                            max_length=locals_max_length,
-                            max_string=locals_max_string,
-                            use_rich=use_rich,
-                        )
-                        for key, value in get_locals(
-                            frame_summary.f_locals.items()
-                        )
-                    }
-                    if show_locals
-                    else None
-                ),
+                locals=frame_locals if show_locals else None,
+                locals_omitted=locals_omitted,
             )
             append(frame)
 
@@ -404,9 +557,50 @@ class ExceptionDictTransformer:
             the exception actually happened.  With larger web frameworks, this
             does not always work, so you should stick with the default.
 
+        max_total_frames:
+            Maximum number of frames across the *whole* exception tree,
+            including all causes, contexts, and exception group members.
+            ``None`` (the default) means no limit.
+
+        max_branches:
+            Maximum number of exception branches (stacks) to render across
+            the whole exception tree.  ``None`` (the default) means no limit.
+            Branches beyond the budget are replaced by a placeholder with
+            structured counts.
+
+        locals_max_total_bytes:
+            Maximum total number of bytes (counted as UTF-8) used for
+            rendered local variables across the whole exception tree.
+            ``None`` (the default) means no limit.  Once the budget is spent,
+            no further locals are rendered and the number of omitted locals
+            is reported in each affected frame's ``locals_omitted`` key.
+
         use_rich: If ``True`` (the default), use rich_ to compute the repr of
             locals.  If ``False`` or if rich_ is not installed, fall back to
             a simpler algorithm.
+
+    If one or more of the budgets *max_total_frames*, *max_branches*, and
+    *locals_max_total_bytes* are set, they are spent in a fixed order: the
+    order in which exceptions are walked -- a stack, then its exception
+    group children in order, and finally its cause/context chain.  The
+    following rules apply:
+
+    - Every rendered branch always keeps its overview: exception type,
+      value, notes, and its position in the cause/context and exception
+      group hierarchy.
+    - *max_frames* is enforced per stack during extraction, throughout the
+      whole tree.
+    - Within each stack, frames are removed from the middle out, so the
+      shallowest frames and the innermost frame (where the exception was
+      raised) are preserved as long as the stack receives any frame budget.
+      Elided frames are reported in place, like with plain *max_frames*.
+    - Locals are never rendered completely and truncated afterwards: once
+      the byte budget is spent, no further repr()s are computed and the
+      number of omitted locals is reported in the affected frame's
+      ``locals_omitted`` key.
+    - Once the branch budget is spent, the remaining branches are replaced
+      by a structured placeholder of the form
+      ``{"truncated": {"stacks": N, "frames": M}}``.
 
     .. seealso::
         :doc:`exceptions` for a broader explanation of *structlog*'s exception
@@ -422,6 +616,11 @@ class ExceptionDictTransformer:
 
     .. versionchanged:: 25.4.0
        Handle exception groups.
+
+    .. versionchanged:: 26.2.0
+       Added *max_total_frames*, *max_branches*, and
+       *locals_max_total_bytes* budgets that apply to the whole exception
+       tree.
     """
 
     show_locals: bool
@@ -431,6 +630,9 @@ class ExceptionDictTransformer:
     locals_hide_sunder: bool
     suppress: Sequence[str]
     max_frames: int
+    max_total_frames: int | None
+    max_branches: int | None
+    locals_max_total_bytes: int | None
     use_rich: bool
 
     def __init__(
@@ -443,6 +645,9 @@ class ExceptionDictTransformer:
         locals_hide_sunder: bool = False,
         suppress: Iterable[str | ModuleType] = (),
         max_frames: int = MAX_FRAMES,
+        max_total_frames: int | None = None,
+        max_branches: int | None = None,
+        locals_max_total_bytes: int | None = None,
         use_rich: bool = True,
     ) -> None:
         if locals_max_length is not None and locals_max_length < 0:
@@ -453,6 +658,18 @@ class ExceptionDictTransformer:
             raise ValueError(msg)
         if max_frames < 2:
             msg = f'"max_frames" must be >= 2: {max_frames}'
+            raise ValueError(msg)
+        if max_total_frames is not None and max_total_frames < 0:
+            msg = f'"max_total_frames" must be >= 0: {max_total_frames}'
+            raise ValueError(msg)
+        if max_branches is not None and max_branches < 0:
+            msg = f'"max_branches" must be >= 0: {max_branches}'
+            raise ValueError(msg)
+        if locals_max_total_bytes is not None and locals_max_total_bytes < 0:
+            msg = (
+                f'"locals_max_total_bytes" must be >= 0: '
+                f"{locals_max_total_bytes}"
+            )
             raise ValueError(msg)
         self.show_locals = show_locals
         self.locals_max_length = locals_max_length
@@ -474,9 +691,41 @@ class ExceptionDictTransformer:
             path = os.path.normpath(os.path.abspath(path))
             self.suppress.append(path)
         self.max_frames = max_frames
+        self.max_total_frames = max_total_frames
+        self.max_branches = max_branches
+        self.locals_max_total_bytes = locals_max_total_bytes
         self.use_rich = use_rich
+        self._budgets_enabled = any(
+            budget is not None
+            for budget in (
+                max_total_frames,
+                max_branches,
+                locals_max_total_bytes,
+            )
+        )
 
     def __call__(self, exc_info: ExcInfo) -> list[dict[str, Any]]:
+        if self._budgets_enabled:
+            # Budget mode: max_frames and the whole-tree budgets are all
+            # enforced during extraction, so nothing that is dropped later
+            # is rendered needlessly.
+            trace = extract(
+                *exc_info,
+                show_locals=self.show_locals,
+                locals_max_length=self.locals_max_length,
+                locals_max_string=self.locals_max_string,
+                locals_hide_dunder=self.locals_hide_dunder,
+                locals_hide_sunder=self.locals_hide_sunder,
+                use_rich=self.use_rich,
+                _budget=_Budget(
+                    frames=self.max_total_frames,
+                    branches=self.max_branches,
+                    locals_bytes=self.locals_max_total_bytes,
+                    per_stack_frames=2 * (self.max_frames // 2),
+                ),
+            )
+            return self._as_dict(trace)
+
         trace = extract(
             *exc_info,
             show_locals=self.show_locals,
@@ -488,6 +737,10 @@ class ExceptionDictTransformer:
         )
 
         for stack in trace.stacks:
+            if isinstance(stack, Truncated):
+                # Can't happen without budgets, but keeps type checkers and
+                # defensive consumers happy.
+                continue
             if len(stack.frames) <= self.max_frames:
                 continue
 
@@ -510,13 +763,26 @@ class ExceptionDictTransformer:
     def _as_dict(self, trace: Trace) -> list[dict[str, Any]]:
         stack_dicts = []
         for stack in trace.stacks:
+            if isinstance(stack, Truncated):
+                stack_dicts.append(
+                    {
+                        "truncated": {
+                            "stacks": stack.stacks,
+                            "frames": stack.frames,
+                        }
+                    }
+                )
+                continue
             stack_dict = asdict(stack)
             for frame_dict in stack_dict["frames"]:
+                if not frame_dict["locals_omitted"]:
+                    del frame_dict["locals_omitted"]
                 if frame_dict["locals"] is None or any(
                     frame_dict["filename"].startswith(path)
                     for path in self.suppress
                 ):
                     del frame_dict["locals"]
+                    frame_dict.pop("locals_omitted", None)
             if stack.is_group:
                 stack_dict["exceptions"] = [
                     self._as_dict(t) for t in stack.exceptions
