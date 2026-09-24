@@ -919,6 +919,11 @@ def test_json_tracebacks_skip_sunder_dunder(
         {"max_frames": -1},
         {"max_frames": 0},
         {"max_frames": 1},
+        {"max_total_frames": -1},
+        {"max_total_frames": 0},
+        {"max_branches": -1},
+        {"max_branches": 0},
+        {"max_locals_bytes": -1},
     ],
 )
 def test_json_traceback_value_error(kwargs: dict[str, Any]) -> None:
@@ -1202,3 +1207,443 @@ def test_exception_cycle():
         )
         == trace.stacks[0]
     )
+
+
+def _raise_chain(depth: int) -> Exception:
+    """
+    Raise and return an exception with a cause chain *depth* exceptions
+    long.  Every exception has exactly one frame.
+    """
+    try:
+        raise ValueError("leaf")
+    except ValueError as e:
+        exc = e
+    for level in range(depth - 1):
+        try:
+            raise RuntimeError(f"level {level}") from exc
+        except RuntimeError as e:
+            exc = e
+    return exc
+
+
+def _raise_group(width: int) -> Exception:
+    """
+    Raise and return an ExceptionGroup with *width* members, each with a
+    traceback of one frame.
+    """
+    exceptions = []
+    for member in range(width):
+        try:
+            raise ValueError(f"member {member}")
+        except ValueError as e:
+            exceptions.append(e)
+    return ExceptionGroup("wide", exceptions)  # noqa: F821
+
+
+class _CountedRepr:
+    """
+    A class that counts how often its repr() is called.
+    """
+
+    renders = 0
+
+    def __repr__(self) -> str:
+        type(self).renders += 1
+        return "x" * 10
+
+
+def _locals_budget_inner() -> None:
+    aa = _CountedRepr()
+    bb = _CountedRepr()
+    raise ValueError("boom")
+
+
+def _locals_budget_outer() -> None:
+    cc = _CountedRepr()
+    _locals_budget_inner()
+
+
+def test_budget_deep_cause_chain_branches() -> None:
+    """
+    A deep cause chain is truncated to max_branches stacks and the rest of
+    the chain is reported in the last stack's "skipped_causes" count.  The
+    hierarchy of the extracted part stays intact.
+    """
+    exc = _raise_chain(10)
+    transformer = tracebacks.ExceptionDictTransformer(max_branches=3)
+
+    result = transformer((type(exc), exc, exc.__traceback__))
+
+    assert 3 == len(result)
+    assert [False, True, True] == [stack["is_cause"] for stack in result]
+    assert "RuntimeError" == result[0]["exc_type"]
+    assert "level 8" == result[0]["exc_value"]
+    # Every extracted exception keeps its overview and its frame.
+    assert all(stack["frames"] for stack in result)
+    assert "skipped_causes" not in result[0]
+    assert "skipped_causes" not in result[1]
+    assert 7 == result[2]["skipped_causes"]
+
+
+def test_budget_total_frames_allocation_order() -> None:
+    """
+    The total frame budget is allocated to stacks in extraction order.
+    Stacks that get no budget anymore only contain a marker frame with the
+    number of skipped frames.
+    """
+    exc = _raise_chain(5)
+    transformer = tracebacks.ExceptionDictTransformer(max_total_frames=2)
+
+    result = transformer((type(exc), exc, exc.__traceback__))
+
+    assert 5 == len(result)
+    real_frames = [
+        frame["name"]
+        for stack in result
+        for frame in stack["frames"]
+        if frame["lineno"] != -1
+    ]
+    assert 2 == len(real_frames)
+    assert result[0]["frames"][0]["lineno"] != -1
+    assert result[1]["frames"][0]["lineno"] != -1
+    marker = {"filename": "", "lineno": -1, "name": "Skipped frames: 1"}
+    for stack in result[2:]:
+        assert [marker] == stack["frames"]
+
+
+def test_budget_total_frames_keeps_first_and_last() -> None:
+    """
+    If a stack's frames don't fit into the remaining total frame budget,
+    the first and last frames are kept and the skipped middle is reported.
+    """
+    raise_lineno = None
+
+    def dive(depth: int) -> None:
+        nonlocal raise_lineno
+        if depth == 0:
+            raise_lineno = get_next_lineno()
+            raise ValueError("deep")
+        dive(depth - 1)
+
+    try:
+        dive(9)
+    except ValueError as e:
+        transformer = tracebacks.ExceptionDictTransformer(max_total_frames=4)
+        result = transformer((type(e), e, e.__traceback__))
+
+    frames = result[0]["frames"]
+    assert 5 == len(frames)
+    assert "test_budget_total_frames_keeps_first_and_last" == frames[0]["name"]
+    assert "dive" == frames[1]["name"]
+    assert {
+        "filename": "",
+        "lineno": -1,
+        "name": "Skipped frames: 7",
+    } == frames[2]
+    assert "dive" == frames[3]["name"]
+    assert "dive" == frames[4]["name"]
+    assert raise_lineno == frames[4]["lineno"]
+
+
+def test_budget_total_frames_keeps_innermost_if_only_one_fits() -> None:
+    """
+    If only one frame fits into the remaining total frame budget, the last
+    (innermost) frame is kept.
+    """
+    raise_lineno = None
+
+    def dive(depth: int) -> None:
+        nonlocal raise_lineno
+        if depth == 0:
+            raise_lineno = get_next_lineno()
+            raise ValueError("deep")
+        dive(depth - 1)
+
+    try:
+        dive(9)
+    except ValueError as e:
+        transformer = tracebacks.ExceptionDictTransformer(max_total_frames=1)
+        result = transformer((type(e), e, e.__traceback__))
+
+    frames = result[0]["frames"]
+    assert 2 == len(frames)
+    assert {
+        "filename": "",
+        "lineno": -1,
+        "name": "Skipped frames: 10",
+    } == frames[0]
+    assert "dive" == frames[1]["name"]
+    assert raise_lineno == frames[1]["lineno"]
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_budget_wide_exception_group_branches() -> None:
+    """
+    A wide exception group is truncated to max_branches members and the
+    remaining members are reported in the group's "skipped_exceptions"
+    count.  The group hierarchy stays visible.
+    """
+    exc = _raise_group(100)
+    transformer = tracebacks.ExceptionDictTransformer(max_branches=10)
+
+    result = transformer((type(exc), exc, exc.__traceback__))
+
+    assert 1 == len(result)
+    (group,) = result
+    assert group["is_group"]
+    assert "ExceptionGroup" == group["exc_type"]
+    assert 9 == len(group["exceptions"])
+    assert 91 == group["skipped_exceptions"]
+    # Each extracted member keeps its own structure.
+    for member_trace in group["exceptions"]:
+        assert "ValueError" == member_trace[0]["exc_type"]
+        assert 1 == len(member_trace[0]["frames"])
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_budget_nested_exception_groups() -> None:
+    """
+    Skipped exception group members are counted including their nested
+    subtrees, and the counts are attached where the elision happened.
+    """
+    inner = ExceptionGroup("inner", _raise_group(3).exceptions)  # noqa: F821
+    exc = ExceptionGroup(  # noqa: F821
+        "outer", [inner, *_raise_group(2).exceptions]
+    )
+
+    # Only the root fits: all members (including the nested group and its
+    # members) are counted on the root.
+    transformer = tracebacks.ExceptionDictTransformer(max_branches=1)
+    result = transformer((type(exc), exc, exc.__traceback__))
+
+    assert 1 == len(result)
+    assert [] == result[0]["exceptions"]
+    assert 6 == result[0]["skipped_exceptions"]
+
+    # The nested group is extracted, but its members are counted on it.
+    transformer = tracebacks.ExceptionDictTransformer(max_branches=2)
+    result = transformer((type(exc), exc, exc.__traceback__))
+
+    (inner_trace,) = result[0]["exceptions"]
+    assert inner_trace[0]["is_group"]
+    assert 3 == inner_trace[0]["skipped_exceptions"]
+    assert 2 == result[0]["skipped_exceptions"]
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_budgets_are_opt_in() -> None:
+    """
+    Without budget arguments, all branches are extracted and no elision
+    counts appear.
+    """
+    exc = _raise_group(50)
+    transformer = tracebacks.ExceptionDictTransformer()
+
+    result = transformer((type(exc), exc, exc.__traceback__))
+
+    assert 50 == len(result[0]["exceptions"])
+    assert "skipped_exceptions" not in result[0]
+    assert "skipped_causes" not in result[0]
+    for member_trace in result[0]["exceptions"]:
+        assert "locals_omitted" not in member_trace[0]["frames"][0]
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_budget_bounds_serialized_size() -> None:
+    """
+    The combination of all budgets bounds the real serialized size of a
+    wide exception group with locals.
+    """
+
+    def raise_with_locals(member: int) -> Exception:
+        payload = "x" * 100
+        try:
+            raise ValueError(f"member {member}")
+        except ValueError as e:
+            return e
+
+    exc = ExceptionGroup(  # noqa: F821
+        "wide", [raise_with_locals(member) for member in range(200)]
+    )
+    exc_info = (type(exc), exc, exc.__traceback__)
+
+    unbounded = tracebacks.ExceptionDictTransformer(show_locals=True)(exc_info)
+    transformer = tracebacks.ExceptionDictTransformer(
+        show_locals=True,
+        max_total_frames=20,
+        max_branches=10,
+        max_locals_bytes=500,
+    )
+    result = transformer(exc_info)
+
+    unbounded_size = len(json.dumps(unbounded))
+    bounded_size = len(json.dumps(result))
+    assert unbounded_size > 20_000
+    assert bounded_size < 5_000
+    assert 191 == result[0]["skipped_exceptions"]
+    # Locals rendering stopped once the budget was exhausted.
+    omitted = [
+        frame["locals_omitted"]
+        for trace in result[0]["exceptions"]
+        for stack in trace
+        for frame in stack["frames"]
+        if "locals_omitted" in frame
+    ]
+    assert omitted and all(count > 0 for count in omitted)
+
+
+def test_budget_locals_bytes_stops_rendering() -> None:
+    """
+    The locals budget stops rendering locals as soon as it is exhausted
+    and reports the number of omitted locals per frame.  repr() is not
+    called for omitted locals.
+    """
+    try:
+        _locals_budget_outer()
+    except ValueError as e:
+        # Drop the test function's own frame for deterministic locals.
+        exc_info = (type(e), e, e.__traceback__.tb_next)
+
+    _CountedRepr.renders = 0
+    # Each local costs 12 bytes: 2 for the key, 10 for the value.
+    transformer = tracebacks.ExceptionDictTransformer(
+        show_locals=True,
+        locals_max_string=None,
+        max_locals_bytes=24,
+        use_rich=False,
+    )
+    result = transformer(exc_info)
+
+    assert 2 == _CountedRepr.renders
+    outer_frame, inner_frame = result[0]["frames"]
+    assert {"cc": "xxxxxxxxxx"} == outer_frame["locals"]
+    assert "locals_omitted" not in outer_frame
+    assert {"aa": "xxxxxxxxxx"} == inner_frame["locals"]
+    assert 1 == inner_frame["locals_omitted"]
+
+    # A budget of zero renders nothing at all.
+    transformer = tracebacks.ExceptionDictTransformer(
+        show_locals=True, max_locals_bytes=0, use_rich=False
+    )
+    result = transformer(exc_info)
+
+    assert 2 == _CountedRepr.renders
+    outer_frame, inner_frame = result[0]["frames"]
+    assert {} == outer_frame["locals"]
+    assert 1 == outer_frame["locals_omitted"]
+    assert {} == inner_frame["locals"]
+    assert 2 == inner_frame["locals_omitted"]
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+@pytest.mark.parametrize("use_rich", [True, False])
+def test_budget_broken_str_and_repr(use_rich: bool) -> None:
+    """
+    An exception whose __str__() raises and a local whose __repr__()
+    raises don't break the extraction of the other branches.
+    """
+
+    class BadStr(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("no str")
+
+    class BadRepr:
+        def __repr__(self) -> str:
+            raise RuntimeError("no repr")
+
+    def raise_bad() -> Exception:
+        bad = BadRepr()
+        try:
+            raise BadStr("bad")
+        except BadStr as e:
+            return e
+
+    def raise_good() -> Exception:
+        try:
+            raise ValueError("good")
+        except ValueError as e:
+            return e
+
+    exc = ExceptionGroup("mixed", [raise_bad(), raise_good()])  # noqa: F821
+    transformer = tracebacks.ExceptionDictTransformer(
+        show_locals=True,
+        max_total_frames=100,
+        max_branches=100,
+        max_locals_bytes=1_000,
+        use_rich=use_rich,
+    )
+    with patch.object(tracebacks, "rich", rich if use_rich else None):
+        result = transformer((type(exc), exc, exc.__traceback__))
+
+    bad_trace, good_trace = result[0]["exceptions"]
+    assert "BadStr" == bad_trace[0]["exc_type"]
+    assert "<str-error" in bad_trace[0]["exc_value"]
+    assert "<repr-error" in bad_trace[0]["frames"][0]["locals"]["bad"]
+    assert "ValueError" == good_trace[0]["exc_type"]
+    assert "good" == good_trace[0]["exc_value"]
+
+
+def test_budget_context_cycle() -> None:
+    """
+    Budgets and elision counts terminate and stay correct even if the
+    context chain contains a cycle.
+    """
+    try:
+        raise ValueError("a")
+    except ValueError as a_exc:
+        try:
+            raise TypeError("b")
+        except TypeError as b_exc:
+            a_exc.__context__ = b_exc
+            b_exc.__context__ = a_exc
+            exc_info = (type(a_exc), a_exc, a_exc.__traceback__)
+
+    transformer = tracebacks.ExceptionDictTransformer(max_branches=1)
+    result = transformer(exc_info)
+
+    assert 1 == len(result)
+    assert "ValueError" == result[0]["exc_type"]
+    assert 1 == result[0]["skipped_causes"]
+
+    # Without a branch limit, the cycle is extracted once and stops.
+    transformer = tracebacks.ExceptionDictTransformer(
+        max_branches=10, max_total_frames=10
+    )
+    result = transformer(exc_info)
+
+    assert 2 == len(result)
+    assert "ValueError" == result[0]["exc_type"]
+    assert "TypeError" == result[1]["exc_type"]
+    assert "skipped_causes" not in result[1]
+
+
+def test_budget_self_cause_cycle() -> None:
+    """
+    An exception that is its own cause doesn't lead to an infinite loop
+    when budgets are enabled.
+    """
+    try:
+        try:
+            exc = ValueError("onoes")
+            raise exc
+        except Exception as exc:
+            raise exc from exc
+    except Exception as e:
+        exc_info = (type(e), e, e.__traceback__)
+
+    result = tracebacks.ExceptionDictTransformer(
+        max_branches=10, max_total_frames=10
+    )(exc_info)
+
+    assert 1 == len(result)
+    assert "ValueError" == result[0]["exc_type"]

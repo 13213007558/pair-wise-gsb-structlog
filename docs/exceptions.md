@@ -32,6 +32,10 @@ The most common use-cases are already covered by the following processors:
 {class}`structlog.tracebacks.ExceptionDictTransformer` can be customized with a number of parameters.
 If these prove insufficient, see {ref}`Custom Filtering of Dict Tracebacks <custom-dict-tracebacks>`.
 
+For example, if your log pipeline drops oversized entries, you can bound the size of the *whole* exception tree using *max_total_frames*, *max_branches*, and *max_locals_bytes*.
+Without them, only *max_frames* is applied to each stack individually, which can still result in huge outputs for wide exception groups or deep cause chains.
+The budgets are spent in extraction order (outermost exception first, then exception group members, then the cause/context chain) and anything that is elided leaves behind a structured count, so the hierarchy of the exception tree stays visible.
+
 
 ## Console rendering
 
