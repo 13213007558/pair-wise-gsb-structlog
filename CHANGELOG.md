@@ -15,6 +15,12 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- Documented the cancellation, exception, and context semantics of the `a`-prefixed async log methods and added regression tests that pin the behavior for both `structlog.stdlib.BoundLogger` and the native filtering bound logger.
+  Cancelling an awaiting coroutine does not revoke a log entry that is already running in the executor, and awaiting only confirms that the sink call returned -- not that a handler persisted the entry.
+
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.

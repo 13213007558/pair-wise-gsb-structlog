@@ -60,6 +60,144 @@ This means an increased computational cost per log entry, but your application w
 ```{versionadded} 23.1.0
 ```
 
+#### Cancellation, exceptions, and what you can rely on
+
+The async methods are thin coroutines around
+{meth}`asyncio.BaseEventLoop.run_in_executor`: they capture the current
+{mod}`contextvars` context, submit the *synchronous* processor chain and sink
+call to the default executor, and await the resulting future.
+Understanding that boundary matters when a request is cancelled or a sink
+raises.
+
+**Cancelling the coroutine does not undo a log entry.**
+`task.cancel()` (and therefore timeouts like {func}`asyncio.wait_for`) only
+cancels the *awaiting* coroutine.
+Three deterministic outcomes are possible, depending on where the work is when
+the cancellation arrives:
+
+1. **Before submission.** If the coroutine is cancelled while it is suspended
+   *before* `run_in_executor()` is reached, nothing is submitted to the
+   executor and no write can happen. This is the only case where
+   "cancelled" also means "definitely not written".
+2. **While the sink is executing.** The work item has already been handed to a
+   worker thread. Python cannot interrupt a running thread, so the processor
+   chain and the sink call keep running and an entry that is already in flight
+   can still be written. The coroutine you awaited raises
+   {class}`asyncio.CancelledError` regardless of whether the write ultimately
+   happens. Whether the entry was emitted is **unknown to the holder of the
+   cancelled task** and can only be answered by observing the sink itself.
+3. **After the work finished.** Once the executor work item is done, the future
+   can no longer be cancelled: `cancel()` returns `False` and awaiting returns
+   the normal result instead of `CancelledError`.
+
+Note that cancelling a work item that is still *queued* (not yet picked up by a
+worker) is best-effort: cancellation is scheduled across threads and races with
+the worker taking the item from the queue. Do not write code that assumes a
+queued-but-unstarted entry is reliably withdrawn.
+
+**Sink exceptions propagate -- unless masked by cancellation.**
+If a processor or the sink raises in the worker thread and the task is not
+cancelled, the exception is re-raised when you `await` the method (or is
+available through {meth}`asyncio.Task.exception` on a task you kept).
+If the task is cancelled while the sink is still running, the holder only sees
+`CancelledError`; a failure the sink raises afterwards cannot be observed
+through that cancelled task.
+
+**Context is copied, then restored.**
+The worker runs inside {func}`contextvars.copy_context`, so values bound at call
+time are visible in the processor chain on the worker thread, while mutations
+inside that copy never leak back to the event loop thread.
+The internal callsite context variables are reset in a `finally` block, which
+still runs when the coroutine is cancelled.
+
+**Awaiting is not a disk durability guarantee.**
+Awaiting an `a`-prefixed method (or the task wrapping it) confirms only that the
+synchronous processor chain and the sink's *method call* have returned -- for
+example, that a `logging.Handler.emit()` call finished.
+It does not flush kernel buffers, rotate files, or guarantee that a network or
+file handler has persisted the bytes. Handlers that buffer, queue, or send over
+the network may still hold or lose the entry afterwards. Durability is the
+handler's contract, not the async method's.
+
+#### How to wait until an entry has been written
+
+Keep the task and await it. That is the supported way to wait until the
+processor chain and sink call have completed:
+
+```python
+task = asyncio.create_task(logger.ainfo("audit event"))
+
+# ... do other work, or just:
+await task
+```
+
+What this does and does not give you:
+
+- After `await task` returns normally, the sink call has completed; if it
+  raised, the same exception is raised here (inspect a retained task with
+  `task.exception()` instead of awaiting it).
+- If `await task` raises `asyncio.CancelledError`, the result is unknown: the
+  entry may have been written before or after the cancellation. The only way to
+  know is to make the sink itself observable -- for example, an auditing sink
+  that records acknowledged entries in a durable store, or a queue the
+  application can drain. The task handle cannot answer this question.
+- Fire-and-forget calls (`asyncio.create_task(logger.ainfo(...))` without
+  keeping the task) give no observability at all: once submitted, the work item
+  runs independently of the coroutine that started it, and neither success nor
+  failure is reported back. Use this only for best-effort logging.
+
+A runnable pattern for audit-style logging, including an observable sink that
+can answer the "did it actually get written?" question after a cancellation:
+
+```python
+import asyncio
+import threading
+
+import structlog.stdlib
+
+
+class AcknowledgingSink:
+    """Record acknowledged entries so the outcome stays observable."""
+
+    def __init__(self):
+        # A real implementation would acknowledge into a durable store or a
+        # queue that another component drains.
+        self.acknowledged = []
+        self._lock = threading.Lock()
+
+    def info(self, event, **kw):
+        # ... write to the real destination here ...
+        with self._lock:
+            self.acknowledged.append(event)
+
+
+async def log_and_wait(logger, sink, event):
+    # Keeping the task is what makes the outcome observable to the caller.
+    task = asyncio.create_task(logger.ainfo(event))
+    try:
+        await task  # returns once the processor chain and sink call finished
+    except asyncio.CancelledError:
+        # The await was cancelled, but the executor work may still be running.
+        # The task cannot tell us the answer; ask the sink instead.
+        if event in sink.acknowledged:
+            print("cancelled, but the entry was written")
+        else:
+            print("cancelled before the entry was written (or still in flight)")
+        raise
+    return True
+
+
+async def main():
+    sink = AcknowledgingSink()
+    logger = structlog.stdlib.BoundLogger(sink, processors=[], context={})
+
+    await log_and_wait(logger, sink, "confirmed entry")
+    assert sink.acknowledged == ["confirmed entry"]
+
+
+asyncio.run(main())
+```
+
 ---
 
 

@@ -96,6 +96,15 @@ def make_filtering_bound_logger(
     prefixed by an ``a``. Therefore, the async version of ``log.info("hello")``
     is ``await log.ainfo("hello")``.
 
+    The async variants submit the synchronous processor chain and sink call to
+    the default executor with
+    :meth:`asyncio.BaseEventLoop.run_in_executor`. Cancelling the awaiting
+    coroutine does not interrupt a work item that is already running on a
+    worker thread, so an in-flight entry may still be written; sink exceptions
+    are re-raised by the ``await`` unless cancellation masks them. Awaiting
+    confirms that the sink call returned, not that a handler persisted the
+    entry.
+
     Additionally it has a ``log(self, level: int, **kw: Any)`` method to mirror
     `logging.Logger.log` and `structlog.stdlib.BoundLogger.log`.
 
@@ -178,6 +187,13 @@ def _make_filtering_bound_logger(min_level: int) -> type[FilteringBoundLogger]:
 
         async def ameth(self: Any, event: str, *args: Any, **kw: Any) -> Any:
             """
+            Run the synchronous log method in the default executor.
+
+            Cancelling the awaiting coroutine does not stop an executor work
+            item that is already running, so the entry may still be written;
+            sink exceptions propagate through the ``await`` unless the task is
+            cancelled first.
+
             .. versionchanged:: 23.3.0
                Callsite parameters are now also collected under asyncio.
             """

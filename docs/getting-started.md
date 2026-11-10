@@ -246,6 +246,12 @@ The default *bound logger* that you get back from {func}`structlog.get_logger()`
 
 You can use the sync and async logging methods interchangeably within the same application.
 
+```{warning}
+Cancelling a coroutine that awaits an `a`-prefixed log method (for example via `task.cancel()` or {func}`asyncio.wait_for`) does **not** guarantee the log entry is unwritten.
+Once the work has been handed to the executor thread, it keeps running and the sink may still emit the entry.
+See {doc}`standard-library` for the precise cancellation, exception, and context semantics, and for how to wait until an entry has been written.
+```
+
 
 ## Liked what you saw?
 

@@ -456,6 +456,26 @@ class BoundLogger(BoundLoggerBase):
     ) -> None:
         """
         Merge contextvars and log using the sync logger in a thread pool.
+
+        The synchronous processor chain and sink call run as a work item of
+        the default executor via
+        :meth:`asyncio.BaseEventLoop.run_in_executor`. Note the resulting
+        semantics:
+
+        - Cancelling the awaiting coroutine (including an
+          :func:`asyncio.wait_for` timeout) cancels only the await, not the
+          executor work. If the work item is already running on a worker
+          thread, that thread cannot be interrupted and the sink may still
+          write the entry; a coroutine cancelled before this method submits
+          the work item produces no write at all.
+        - An exception raised by a processor or the sink in the worker thread
+          is re-raised by the ``await`` when the task is not cancelled. If the
+          task is cancelled while the sink is executing, the holder only sees
+          :class:`asyncio.CancelledError` and the sink's later failure is not
+          observable through that task.
+        - Awaiting this coroutine means the sink *call* has returned. It does
+          not guarantee that a handler has persisted the entry to disk or over
+          the network; that is the sink's or handler's responsibility.
         """
         # Capture thread-specific info before handing off to the executor.
         thread_token = _ASYNC_CALLING_THREAD.set(
@@ -484,6 +504,11 @@ class BoundLogger(BoundLoggerBase):
     async def ainfo(self, event: str, *args: Any, **kw: Any) -> None:
         """
         Log using `info()`, but asynchronously in a separate thread.
+
+        Cancellation of the awaiting coroutine does not cancel an executor
+        work item that is already running: the entry may still be written.
+        See `_dispatch_to_sync` for the full cancellation and exception
+        semantics.
 
         .. versionadded:: 23.1.0
         """
