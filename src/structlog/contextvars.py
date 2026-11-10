@@ -28,6 +28,7 @@ from typing import Any, Final
 
 import structlog
 
+from .protected import _apply_protected, get_protected_keys
 from .typing import BindableLogger, EventDict, WrappedLogger
 
 
@@ -88,14 +89,30 @@ def merge_contextvars(
     Use this as your first processor in :func:`structlog.configure` to ensure
     context-local context is included in all log calls.
 
+    Context-local values for keys declared via
+    `structlog.protected.protect_keys` take precedence over values already
+    present in the event dict (from bound context or event keyword
+    arguments); displaced values are handled according to
+    `structlog.protected.configure_protection`.
+
     .. versionadded:: 20.1.0
     .. versionchanged:: 21.1.0 See toplevel note.
+    .. versionchanged:: 26.2.0
+       Protected context-local keys override event dict values.
     """
     ctx = contextvars.copy_context()
+    protected_keys = get_protected_keys()
 
+    protected = {}
     for k in ctx:
         if k.name.startswith(STRUCTLOG_KEY_PREFIX) and ctx[k] is not Ellipsis:
-            event_dict.setdefault(k.name[STRUCTLOG_KEY_PREFIX_LEN:], ctx[k])
+            key = k.name[STRUCTLOG_KEY_PREFIX_LEN:]
+            if key in protected_keys:
+                protected[key] = ctx[k]
+            else:
+                event_dict.setdefault(key, ctx[k])
+
+    _apply_protected(event_dict, protected)
 
     return event_dict
 

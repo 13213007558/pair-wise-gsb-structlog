@@ -18,6 +18,27 @@ class DropEvent(BaseException):
     """
 
 
+class ProtectedKeyError(Exception):
+    """
+    An event keyword argument tried to override a protected context field
+    while `structlog.protected` is configured with
+    ``on_conflict="raise"``.
+
+    The conflicting event keyword arguments are available as the
+    `conflicts` attribute.
+
+    .. versionadded:: 26.2.0
+    """
+
+    def __init__(self, conflicts: dict[str, object]) -> None:
+        self.conflicts = conflicts
+        keys = ", ".join(sorted(conflicts))
+        super().__init__(
+            "Event keyword argument(s) tried to override protected "
+            f"context field(s): {keys}"
+        )
+
+
 class NoConsoleRendererConfiguredError(Exception):
     """
     A user asked for the current `structlog.dev.ConsoleRenderer` but none is

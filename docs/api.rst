@@ -66,6 +66,8 @@ API Reference
 
 .. autoexception:: DropEvent
 
+.. autoexception:: ProtectedKeyError
+
 .. autoclass:: BoundLoggerBase
    :members: new, bind, unbind, try_unbind, _logger, _process_event, _proxy_to_logger
 
@@ -138,6 +140,17 @@ API Reference
 .. autofunction:: clear_contextvars
 .. autofunction:: unbind_contextvars
 .. autofunction:: reset_contextvars
+
+`structlog.protected` Module
+----------------------------
+
+.. automodule:: structlog.protected
+
+.. autofunction:: protect_keys
+.. autofunction:: unprotect_keys
+.. autofunction:: get_protected_keys
+.. autofunction:: configure_protection
+.. autofunction:: reset_protection
 
 `structlog.threadlocal` Module
 ------------------------------

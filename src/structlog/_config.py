@@ -24,6 +24,7 @@ from ._output import PrintLoggerFactory
 from .contextvars import merge_contextvars
 from .dev import ConsoleRenderer, _has_colors, set_exc_info
 from .processors import StackInfoRenderer, TimeStamper, add_log_level
+from .protected import reset_protection
 from .typing import BindableLogger, Context, Processor, WrappedLogger
 
 
@@ -301,6 +302,7 @@ def reset_defaults() -> None:
     _CONFIG.default_context_class = _BUILTIN_DEFAULT_CONTEXT_CLASS
     _CONFIG.logger_factory = _BUILTIN_DEFAULT_LOGGER_FACTORY
     _CONFIG.cache_logger_on_first_use = _BUILTIN_CACHE_LOGGER_ON_FIRST_USE
+    reset_protection()
 
 
 class BoundLoggerLazyProxy:

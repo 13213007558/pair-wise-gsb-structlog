@@ -22,6 +22,7 @@ from structlog import (
     contextvars,
     dev,
     processors,
+    protected,
     stdlib,
     testing,
     threadlocal,
@@ -50,7 +51,7 @@ from structlog._output import (
     WriteLogger,
     WriteLoggerFactory,
 )
-from structlog.exceptions import DropEvent
+from structlog.exceptions import DropEvent, ProtectedKeyError
 from structlog.testing import ReturnLogger, ReturnLoggerFactory
 
 
@@ -76,6 +77,7 @@ __all__ = [
     "DropEvent",
     "PrintLogger",
     "PrintLoggerFactory",
+    "ProtectedKeyError",
     "ReturnLogger",
     "ReturnLoggerFactory",
     "WriteLogger",
@@ -91,6 +93,7 @@ __all__ = [
     "is_configured",
     "make_filtering_bound_logger",
     "processors",
+    "protected",
     "reset_defaults",
     "stdlib",
     "testing",

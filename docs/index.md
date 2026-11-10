@@ -61,6 +61,7 @@ bound-loggers
 configuration
 processors
 contextvars
+protected-fields
 exceptions
 ```
 

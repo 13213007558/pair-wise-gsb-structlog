@@ -15,6 +15,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from structlog.exceptions import DropEvent
+from structlog.protected import _apply_protected
 
 from .typing import BindableLogger, Context, Processor, WrappedLogger
 
@@ -162,11 +163,17 @@ class BoundLoggerBase:
             Allow final processor to return `bytes`.
         .. versionchanged:: 21.2.0
             Allow final processor to return a `bytearray`.
+        .. versionchanged:: 26.2.0
+            Bound values for keys declared via
+            `structlog.protected.protect_keys` can no longer be overridden
+            by *event_kw*.
         """
         # We're typing it as Any, because processors can return more than an
         # EventDict.
         event_dict: Any = self._context.copy()
         event_dict.update(event_kw)
+        # Re-assert bound values for protected keys over event kwargs.
+        _apply_protected(event_dict, self._context)
 
         if event is not None:
             event_dict["event"] = event

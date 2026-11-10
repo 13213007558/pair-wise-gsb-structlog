@@ -15,6 +15,14 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- New `structlog.protected` module: declare context field names (for example an `actor_id` bound by authentication middleware) as protected via `structlog.protected.protect_keys()`.
+  Bound values for protected fields can no longer be silently overridden by event keyword arguments like `log.info("msg", **user_payload)` -- conflicting values are moved to a `protected_conflicts` key or raise `structlog.ProtectedKeyError`, depending on `structlog.protected.configure_protection()`.
+  Enforcement is consistent across `bind()`, `new()`, `unbind()`, `structlog.contextvars.merge_contextvars`, and all bound loggers including `structlog.stdlib.BoundLogger` and its async variant.
+  See [Protected Fields](https://www.structlog.org/en/stable/protected-fields.html).
+
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.
