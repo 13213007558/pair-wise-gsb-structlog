@@ -1518,6 +1518,291 @@ class TestProcessorFormatter:
         assert proc.format(record)
         assert "le msg: %s" == event_dicts[0]["event"]
 
+    @staticmethod
+    def _redact_nested_privacy(logger, name, event_dict):
+        """
+        Display-side processor that mutates a *nested* value in place.
+        """
+        payload = event_dict.get("payload")
+        if isinstance(payload, dict):
+            payload.pop("ssn", None)
+
+        return event_dict
+
+    @staticmethod
+    def _build_formatter(pre_chain, processors, copy_on_format):
+        return ProcessorFormatter(
+            processors=[
+                *processors,
+                ProcessorFormatter.remove_processors_meta,
+                JSONRenderer(),
+            ],
+            foreign_pre_chain=pre_chain,
+            copy_on_format=copy_on_format,
+        )
+
+    def _build_handlers(self, copy_on_format):
+        archive_stream = StringIO()
+        archive_handler = logging.StreamHandler(archive_stream)
+        # ExtraAdder runs in the pre-chain so plain logging ``extra`` values
+        # become part of the event dict.
+        archive_handler.setFormatter(
+            self._build_formatter([ExtraAdder()], [], copy_on_format)
+        )
+
+        display_stream = StringIO()
+        display_handler = logging.StreamHandler(display_stream)
+        # The redaction processor runs for *all* entries, including ones
+        # originating from structlog, which never go through foreign_pre_chain.
+        display_handler.setFormatter(
+            self._build_formatter(
+                [ExtraAdder()],
+                [self._redact_nested_privacy],
+                copy_on_format,
+            )
+        )
+
+        return (
+            archive_handler,
+            archive_stream,
+            display_handler,
+            display_stream,
+        )
+
+    @pytest.mark.parametrize("display_first", [False, True])
+    @pytest.mark.parametrize("via", ["structlog", "extra"])
+    def test_copy_on_format_isolates_handlers(self, via, display_first):
+        """
+        With copy_on_format, a processor that mutates nested values cannot
+        affect other handlers, regardless of handler order or how the entry
+        entered logging.
+        """
+        root = logging.getLogger()
+        root.handlers.clear()
+        root.setLevel(logging.DEBUG)
+
+        (
+            archive_handler,
+            archive_stream,
+            display_handler,
+            display_stream,
+        ) = self._build_handlers(copy_on_format=True)
+        handlers = (
+            (display_handler, archive_handler)
+            if display_first
+            else (archive_handler, display_handler)
+        )
+        for handler in handlers:
+            root.addHandler(handler)
+
+        configure(
+            processors=[ProcessorFormatter.wrap_for_formatter],
+            logger_factory=LoggerFactory(),
+            wrapper_class=BoundLogger,
+        )
+
+        business_object = {"user": "alice", "ssn": "111-22-3333"}
+        if via == "structlog":
+            get_logger().info("audit", payload=business_object)
+        else:
+            root.info("audit", extra={"payload": business_object})
+
+        archive = json.loads(archive_stream.getvalue())
+        display = json.loads(display_stream.getvalue())
+
+        assert "111-22-3333" == archive["payload"]["ssn"]
+        assert "ssn" not in display["payload"]
+        # The caller's own object is never touched.
+        assert "111-22-3333" == business_object["ssn"]
+
+    @pytest.mark.parametrize("display_first", [False, True])
+    @pytest.mark.parametrize("via", ["structlog", "extra"])
+    def test_shared_nested_values_leak_without_copy_on_format(
+        self, via, display_first
+    ):
+        """
+        Documents the default behavior: shallow copies share nested values,
+        so handler order changes archive output and the caller's object is
+        mutated. This is the regression that copy_on_format fixes.
+        """
+        root = logging.getLogger()
+        root.handlers.clear()
+        root.setLevel(logging.DEBUG)
+
+        (
+            archive_handler,
+            archive_stream,
+            display_handler,
+            _display_stream,
+        ) = self._build_handlers(copy_on_format=False)
+        handlers = (
+            (display_handler, archive_handler)
+            if display_first
+            else (archive_handler, display_handler)
+        )
+        for handler in handlers:
+            root.addHandler(handler)
+
+        configure(
+            processors=[ProcessorFormatter.wrap_for_formatter],
+            logger_factory=LoggerFactory(),
+            wrapper_class=BoundLogger,
+        )
+
+        business_object = {"user": "alice", "ssn": "111-22-3333"}
+        if via == "structlog":
+            get_logger().info("audit", payload=business_object)
+        else:
+            root.info("audit", extra={"payload": business_object})
+
+        archive = json.loads(archive_stream.getvalue())
+
+        if display_first:
+            assert "ssn" not in archive["payload"]
+        else:
+            assert "111-22-3333" == archive["payload"]["ssn"]
+        # The shared reference means the caller's object is mutated too.
+        assert "ssn" not in business_object
+
+    def test_copy_on_format_warns_and_keeps_uncopyable_value(self):
+        """
+        Values that cannot be deep-copied are kept as-is, trigger a
+        UserWarning, and do not prevent isolation of the remaining values.
+        """
+
+        class Uncopyable:
+            def __deepcopy__(self, memo):
+                raise TypeError("cannot copy")
+
+        root = logging.getLogger()
+        root.handlers.clear()
+        root.setLevel(logging.DEBUG)
+
+        (
+            archive_handler,
+            archive_stream,
+            display_handler,
+            display_stream,
+        ) = self._build_handlers(copy_on_format=True)
+        root.addHandler(display_handler)
+        root.addHandler(archive_handler)
+
+        configure(
+            processors=[ProcessorFormatter.wrap_for_formatter],
+            logger_factory=LoggerFactory(),
+            wrapper_class=BoundLogger,
+        )
+
+        uncopyable = Uncopyable()
+        business_object = {"user": "alice", "ssn": "111-22-3333"}
+        with pytest.warns(UserWarning, match="could not be deep-copied"):
+            get_logger().info(
+                "audit", payload=business_object, handle=uncopyable
+            )
+
+        archive = json.loads(archive_stream.getvalue())
+        display = json.loads(display_stream.getvalue())
+
+        assert "111-22-3333" == archive["payload"]["ssn"]
+        assert "ssn" not in display["payload"]
+        assert "111-22-3333" == business_object["ssn"]
+
+    def test_copy_on_format_isolates_top_level_changes(self):
+        """
+        Even when every value is uncopyable, the event dict itself is a
+        fresh object per formatter, so key additions and removals stay
+        local.
+        """
+
+        class Uncopyable:
+            def __deepcopy__(self, memo):
+                raise TypeError("cannot copy")
+
+        def add_key(logger, name, event_dict):
+            event_dict["added_by_display"] = True
+            return event_dict
+
+        archive_stream = StringIO()
+        archive_handler = logging.StreamHandler(archive_stream)
+        archive_handler.setFormatter(
+            self._build_formatter([ExtraAdder()], [], True)
+        )
+
+        display_stream = StringIO()
+        display_handler = logging.StreamHandler(display_stream)
+        display_handler.setFormatter(
+            self._build_formatter([ExtraAdder()], [add_key], True)
+        )
+
+        root = logging.getLogger()
+        root.handlers.clear()
+        root.setLevel(logging.DEBUG)
+        root.addHandler(display_handler)
+        root.addHandler(archive_handler)
+
+        with pytest.warns(UserWarning):
+            root.info("audit", extra={"handle": Uncopyable()})
+
+        assert "added_by_display" not in json.loads(
+            archive_stream.getvalue()
+        )
+        assert (
+            json.loads(display_stream.getvalue())["added_by_display"]
+            is True
+        )
+
+    def test_copy_on_format_runs_pre_chain_on_copied_values(self):
+        """
+        The foreign pre-chain sees the deep copy, so mutations there are
+        isolated as well.
+        """
+
+        def redact_in_pre_chain(logger, name, event_dict):
+            record = event_dict["_record"]
+            if hasattr(record, "payload"):
+                record.payload.pop("ssn", None)
+            return event_dict
+
+        archive_stream = StringIO()
+        archive_handler = logging.StreamHandler(archive_stream)
+        archive_handler.setFormatter(
+            ProcessorFormatter(
+                processors=[
+                    ProcessorFormatter.remove_processors_meta,
+                    JSONRenderer(),
+                ],
+                foreign_pre_chain=[ExtraAdder()],
+                copy_on_format=True,
+            )
+        )
+
+        display_stream = StringIO()
+        display_handler = logging.StreamHandler(display_stream)
+        display_handler.setFormatter(
+            ProcessorFormatter(
+                processors=[
+                    ProcessorFormatter.remove_processors_meta,
+                    JSONRenderer(),
+                ],
+                foreign_pre_chain=[ExtraAdder(), redact_in_pre_chain],
+                copy_on_format=True,
+            )
+        )
+
+        root = logging.getLogger()
+        root.handlers.clear()
+        root.setLevel(logging.DEBUG)
+        root.addHandler(display_handler)
+        root.addHandler(archive_handler)
+
+        business_object = {"user": "alice", "ssn": "111-22-3333"}
+        root.info("audit", extra={"payload": business_object})
+
+        assert "111-22-3333" == (
+            json.loads(archive_stream.getvalue())["payload"]["ssn"]
+        )
+        assert "111-22-3333" == business_object["ssn"]
+
 
 @pytest_asyncio.fixture(name="abl")
 async def _abl(cl):

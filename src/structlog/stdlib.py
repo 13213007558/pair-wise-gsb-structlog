@@ -16,6 +16,7 @@ __lazy_modules__ = ["asyncio", "threading", "warnings"]
 
 import asyncio
 import contextvars
+import copy
 import functools
 import logging
 import sys
@@ -950,6 +951,78 @@ class ExtraAdder:
 LOG_KWARG_NAMES = ("exc_info", "stack_info", "stacklevel")
 
 
+def _deep_copy_value(value: Any, memo: dict[int, Any], what: str) -> Any:
+    """
+    Deep-copy *value* using *memo*, keeping the original on failure.
+
+    A value that cannot be deep-copied doesn't take the whole event
+    dictionary down with it: the original value is kept and a `UserWarning`
+    is emitted instead. *what* identifies the offending key in the warning.
+    """
+    try:
+        return copy.deepcopy(value, memo)
+    except Exception as error:  # noqa: BLE001
+        warnings.warn(
+            "Value for %s could not be deep-copied for ProcessorFormatter "
+            "and is shared with the original LogRecord: %s: %s"
+            % (what, type(error).__name__, error),
+            category=UserWarning,
+            stacklevel=3,
+        )
+        return value
+
+
+def _deep_copy_event_dict(event_dict: EventDict) -> EventDict:
+    """
+    Return an isolated copy of *event_dict*.
+
+    Each value is copied independently so that a value that cannot be
+    deep-copied doesn't take the whole event dictionary down with it: the
+    original value is kept and a `UserWarning` is emitted instead. The
+    dictionary itself is always a fresh object, which keeps top-level
+    additions, removals, and reassignments isolated even when every value is
+    uncopyable.
+
+    `copy.deepcopy` is called with a shared `memo` so that objects that
+    appear both on the record and in the event dictionary (including
+    reference cycles) are only copied once.
+
+    The internal ``_record`` and ``_from_structlog`` keys are passed through
+    untouched: the `logging.LogRecord` is already a per-formatter shallow
+    copy made in `format`, and processors only consume it read-only.
+    """
+    copied: EventDict = {}
+    memo: dict[int, Any] = {}
+    for key, value in event_dict.items():
+        if key in ("_record", "_from_structlog"):
+            copied[key] = value
+        else:
+            copied[key] = _deep_copy_value(
+                value, memo, "event dict key %r" % key
+            )
+
+    return copied
+
+
+def _deep_copy_record_extra(record: logging.LogRecord) -> None:
+    """
+    Deep-copy non-standard attributes on *record* in place.
+
+    Values passed through the standard library's ``extra`` argument are
+    stored directly on the `logging.LogRecord`, so the shallow record copy
+    made in `format` still shares them with the original record and the
+    caller's business objects. Standard `logging.LogRecord` attributes and
+    structlog's private ``_logger``/``_name`` markers are left alone.
+    """
+    memo: dict[int, Any] = {}
+    for key, value in record.__dict__.items():
+        if key in _LOG_RECORD_KEYS or key in ("_logger", "_name"):
+            continue
+        record.__dict__[key] = _deep_copy_value(
+            value, memo, "LogRecord extra %r" % key
+        )
+
+
 def render_to_log_args_and_kwargs(
     _: logging.Logger, __: str, event_dict: EventDict
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
@@ -1085,6 +1158,19 @@ class ProcessorFormatter(logging.Formatter):
             If True, use ``record.getMessage`` to get a fully rendered log
             message, otherwise use ``str(record.msg)``. (default: True)
 
+        copy_on_format:
+            If True, the event dictionary is deep-copied before the
+            processor chain runs. This makes each formatter's view of the
+            log entry independent: processors that mutate nested values --
+            for example, a redaction processor deleting a privacy field --
+            can no longer affect other handlers, the original
+            `logging.LogRecord`, or the caller's business objects,
+            regardless of handler order.
+
+            Values that cannot be deep-copied are kept as-is and trigger a
+            `UserWarning`; see :doc:`standard-library` for the associated
+            conventions. (default: False)
+
     Raises:
         TypeError: If both or neither *processor* and *processors* are passed.
 
@@ -1097,6 +1183,7 @@ class ProcessorFormatter(logging.Formatter):
        *processor* (singular) in favor of *processors* (plural). Removal is not
        planned.
     .. versionadded:: 23.3.0 *use_get_message*
+    .. versionadded:: 26.2.0 *copy_on_format*
     """
 
     processors: Sequence[Processor]
@@ -1106,6 +1193,7 @@ class ProcessorFormatter(logging.Formatter):
     logger: logging.Logger | None
     pass_foreign_args: bool
     use_get_message: bool
+    copy_on_format: bool
 
     def __init__(
         self,
@@ -1117,6 +1205,7 @@ class ProcessorFormatter(logging.Formatter):
         logger: logging.Logger | None = None,
         pass_foreign_args: bool = False,
         use_get_message: bool = True,
+        copy_on_format: bool = False,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -1144,6 +1233,7 @@ class ProcessorFormatter(logging.Formatter):
         self.logger = logger
         self.pass_foreign_args = pass_foreign_args
         self.use_get_message = use_get_message
+        self.copy_on_format = copy_on_format
 
     def format(self, record: logging.LogRecord) -> str:
         """
@@ -1156,11 +1246,19 @@ class ProcessorFormatter(logging.Formatter):
         # process the original one
         record = logging.makeLogRecord(record.__dict__)
 
+        # Values passed via logging's ``extra`` live on the record itself, so
+        # the shallow copy above still shares them; isolate them first.
+        if self.copy_on_format:
+            _deep_copy_record_extra(record)
+
         logger = getattr(record, "_logger", _SENTINEL)
         meth_name = getattr(record, "_name", "__structlog_sentinel__")
 
         ed: ProcessorReturnValue
-        if logger is not _SENTINEL and meth_name != "__structlog_sentinel__":
+        is_structlog_record = (
+            logger is not _SENTINEL and meth_name != "__structlog_sentinel__"
+        )
+        if is_structlog_record:
             # Both attached by wrap_for_formatter
             if self.logger is not None:
                 logger = self.logger
@@ -1196,6 +1294,16 @@ class ProcessorFormatter(logging.Formatter):
             if record.stack_info:
                 ed["stack_info"] = record.stack_info
 
+        # The record and the top-level event dict are only shallow copies.
+        # Nested values are still shared with the original LogRecord, other
+        # handlers' formatters, and the caller's business objects, so
+        # in-place mutations by processors leak across handler boundaries.
+        # The copy has to happen before the foreign pre-chain, because it
+        # introduces additional shared values (for example via ExtraAdder).
+        if self.copy_on_format:
+            ed = _deep_copy_event_dict(cast(EventDict, ed))
+
+        if not is_structlog_record:
             # Non-structlog allows to run through a chain to prepare it for the
             # final processor (e.g. adding timestamps and log levels).
             for proc in self.foreign_pre_chain or ():

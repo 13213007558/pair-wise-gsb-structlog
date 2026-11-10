@@ -15,6 +15,13 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.stdlib.ProcessorFormatter` now takes a `copy_on_format` argument.
+  When enabled, the event dictionary and non-standard `logging.LogRecord` attributes (values passed via `extra` / `ExtraAdder`) are deep-copied before any processor runs, so processors that mutate nested values (for example, a redaction processor) no longer affect other handlers, the original record, or the caller's business objects -- regardless of handler order.
+  Values that cannot be deep-copied are kept as-is and trigger a `UserWarning`.
+
+
 ### Changed
 
 - On Python 3.15 and later, *structlog* uses [PEP 810](https://peps.python.org/pep-0810/) lazy imports for modules that are only needed once you log.

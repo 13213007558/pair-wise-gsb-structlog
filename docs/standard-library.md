@@ -576,5 +576,59 @@ Additionally, for both `logging` and *structlog* -- but only for the colorful lo
 If you leave `foreign_pre_chain` as `None`, formatting will be left to `logging`.
 Meaning: you can define a `format` for {class}`~structlog.stdlib.ProcessorFormatter` too!
 
+#### Isolation between multiple handlers
+
+A single `logging` record is handed to every handler attached to a logger.
+{class}`~structlog.stdlib.ProcessorFormatter` protects other handlers in two ways:
+
+1. It makes a shallow copy of the {class}`logging.LogRecord` (`logging.makeLogRecord(record.__dict__)`) before formatting, and
+2. for *structlog* entries, it makes a shallow copy of the event dictionary (`record.msg.copy()`).
+
+Both copies are **shallow**, which is an intentional performance choice:
+
+- the event dictionary itself, and the standard attributes of the `LogRecord`, are isolated -- adding, removing, or reassigning a top-level key in one formatter never affects another formatter;
+- **nested values are not copied**. A dict, list, or custom object you pass as a keyword argument (for example, `log.info("audit", payload=business_object)`) or through `logging`'s `extra` parameter stays the very same object across:
+  - the caller's business object,
+  - the original `LogRecord` stored on the logging handler,
+  - the event dictionaries that every `ProcessorFormatter` builds from that record.
+
+The same is true on the *structlog* side: {class}`structlog.stdlib.BoundLogger` creates the event dictionary with a shallow `dict.copy()` of the bound context, so nested context values are shared as well.
+
+As a consequence, a processor that **mutates a nested value in place** -- for example, a display-side redaction processor that does `event_dict["payload"].pop("ssn")` -- changes the object that the other handlers see too.
+Because handlers run in attachment order, moving the display handler before the archive handler changes what ends up in the archive.
+A shallow `record.copy()` does not prevent this; only copying the nested value does.
+
+##### The `copy_on_format` option
+
+{class}`~structlog.stdlib.ProcessorFormatter` takes a `copy_on_format` argument (default `False`).
+When enabled, the formatter deep-copies the data before any processor -- including the `foreign_pre_chain` -- runs, on both entry paths:
+
+- every value in the event dictionary is deep-copied;
+- non-standard attributes on the `LogRecord` (that is, values that arrived through `logging`'s `extra` or through {class}`~structlog.stdlib.ExtraAdder`) are deep-copied on the formatter's private record copy.
+
+With `copy_on_format=True`, in-place mutations by processors are fully local to that formatter.
+Archive output no longer depends on whether the display handler is attached first or last, and the caller's business objects are never modified by logging:
+
+```python
+formatter = structlog.stdlib.ProcessorFormatter(
+    processors=[redact_privacy, structlog.dev.ConsoleRenderer()],
+    copy_on_format=True,
+)
+```
+
+Values that cannot be deep-copied (objects raising in `__deepcopy__`, open file or socket handles, some locks, and so on) are kept as-is and a `UserWarning` is emitted naming the offending key.
+The event dictionary itself is still a fresh object, so top-level changes remain isolated; only the uncopyable value stays shared.
+If you need a guarantee for such values, make them copyable (for example, give the class a `__deepcopy__` that duplicates the safe state and recreates or reuses the handle), or convert them to a copyable representation (a path string instead of an open file, a rendered traceback string instead of a live exception tuple) in an early processor.
+
+The cost of enabling the option is one `copy.deepcopy` of the event data per handler per record, plus the memory for the duplicated object graph.
+It is opt-in to preserve the zero-copy default and its performance characteristics; enable it on handlers whose processors mutate nested values, or whenever several handlers consume the same record with different redaction rules.
+
+##### Conventions for processors
+
+Even without `copy_on_format`, processors should follow these rules:
+
+- Prefer returning a modified copy over mutating inputs: build a new dict (`{**event_dict, "payload": {**event_dict["payload"], ...}}`) instead of calling `.pop()` on a nested object.
+- Treat `_record` and the original `LogRecord` as read-only.
+- If a processor must mutate in place, it is responsible for copying the specific nested value it touches first -- the library only copies top-level containers.
 
 [*python-json-logger*]: https://github.com/nhairs/python-json-logger
